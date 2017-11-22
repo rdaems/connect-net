@@ -468,13 +468,16 @@ class DeepQ:
 
 
 class DRL:
-    def __init__(self, width, height, n, num_filters, num_residual_blocks, num_games, mcts_budget, mcts_c):
+    def __init__(self, width, height, n, num_filters, num_residual_blocks, batch_size, num_training_steps, num_games, mcts_budget, mcts_c, mcts_temperature):
         self.width = width
         self.height = height
         self.n = n
+        self.batch_size = batch_size
+        self.num_training_steps = num_training_steps
         self.num_games = num_games
         self.mcts_budget = mcts_budget
         self.mcts_c = mcts_c
+        self.mcts_temperature = mcts_temperature
         self.memory = deque(maxlen=10000)
         self.model = self.model_definition(self.width, self.height, num_filters, num_residual_blocks)
 
@@ -482,53 +485,64 @@ class DRL:
     def model_definition(width, height, num_filters, num_residual_blocks):
         # input is 2 layers: stones of both players (1: stone, 0: no), it's always the first player's move
         def residual_block(input):
-            conv1 = Convolution2D(num_filters, 3, 1, 'same', activation='relu')(input)
+            conv1 = Convolution2D(num_filters, 3, padding='same', activation='relu')(input)
             norm1 = BatchNormalization()(conv1)
-            conv2 = Convolution2D(num_filters, 3, 1, 'same', activation='relu')(norm1)
+            conv2 = Convolution2D(num_filters, 3, padding='same', activation='relu')(norm1)
             norm2 = BatchNormalization()(conv2)
             output = Add()([norm2, input])
             return output
 
         input = Input(shape=(height, width, 2))
-        conv = Convolution2D(num_filters, 3, 1, 'same', activation='relu')(input)
+        conv = Convolution2D(num_filters, 3, padding='same', activation='relu')(input)
         residual_input = BatchNormalization()(conv)
         for _ in range(num_residual_blocks):
             residual_output = residual_block(residual_input)
             residual_input = residual_output
 
-        value_head_conv = Convolution2D(1, 1, 1, 'same', activation='relu')(residual_input)
+        value_head_conv = Convolution2D(1, 1, padding='same', activation='relu')(residual_input)
         value_head_norm = BatchNormalization()(value_head_conv)
         value_head_flat = Flatten()(value_head_norm)
         value_head_hidden = Dense(height * width, activation='relu')(value_head_flat)
         value_head = Dense(1, activation='tanh', name='value_head')(value_head_hidden)
 
-        policy_head_conv = Convolution2D(2, 1, 1, 'same', activation='relu')(residual_input)
+        policy_head_conv = Convolution2D(2, 1, padding='same', activation='relu')(residual_input)
         policy_head_norm = BatchNormalization()(policy_head_conv)
         policy_head_flat = Flatten()(policy_head_norm)
-        policy_head = Dense(width)(policy_head_flat, name='policy_head')(policy_head_norm)
+        policy_head = Dense(width, name='policy_head')(policy_head_flat)
 
         model = Model(input=input, outputs=[policy_head, value_head])
 
         return model
 
-    def prepare_input(self, game):
-        state = game.state * game.player
-        x = np.concatenate([state == 1, state == -1]).astype(np.int8)
-        return x
+    @staticmethod
+    def prepare_input(game=None, state=None):
+        if state is None:
+            state = game.state * game.player
+        x = np.stack([state == 1, state == -1], axis=-1).astype(np.int8)
+        return x[None, ...]
 
     def infer_game(self, game):
-        x = self.prepare_input(game)
+        x = self.prepare_input(game=game)
         p, v = self.model.predict(x)
-        return p, v
+        return p.flatten(), v
 
     def play_game(self):
         game = Game(width=self.width, height=self.height, n=self.n)
         root = RootNode(game)
+        memory = []
         while True:
             for _ in range(self.mcts_budget):
                 root.visit(self.infer_game, c=self.mcts_c)
-            scores = [child.N for child in root.children]
-            i = int(np.argmax(scores))
+            N = np.array([child.N for child in root.children])
+            pi_valid = N ** (1 / self.mcts_temperature)
+            pi_valid = pi_valid / pi_valid.sum()
+            pi = np.zeros(self.width)
+            for i, p in enumerate(pi_valid):
+                move = root.children[i].move
+                pi[move] = p
+            pi = pi / pi.sum()
+            memory.append((game.state * game.player, pi))
+            i = np.random.choice(len(pi_valid), p=pi_valid)
             # new root:
             root = root.children[i]  # remove parent to save memory?
             # make the move
@@ -538,16 +552,47 @@ class DRL:
                 break
         if wins[0] > wins[1]:
             print('White player wins.')
+            memory_wins = (np.arange(len(memory)) + 1) % 2
         elif wins[0] < wins[1]:
             print('Black player wins.')
+            memory_wins = np.arange(len(memory)) % 2
         elif wins[2] == 1:
             print('Draw.')
-
+            memory_wins = np.zeros(len(memory))
+        memory_w = []
+        for (state, p), w in zip(memory, wins):
+            memory_w.append((state, p, w))
+        memory_augmented = [(state[:, ::-1], p[::-1], w) for state, p, w in memory_w]
+        memory = memory_w + memory_augmented
+        self.memory.extend(memory)
 
     def train(self):
-        for _ in range(self.num_games):
-            self.play_game()
+        self.model.compile(
+            Adam(lr=0.01, decay=0.005),
+            loss={'policy_head': 'categorical_crossentropy', 'value_head': 'mean_squared_error'}
+        )
+        self.model.summary()
+        while True:
+            for _ in range(self.num_games):
+                self.play_game()
+                print('%d/%d' % (_, self.num_games))
+            self.model.fit_generator(
+                self.generate_input(self.batch_size),
+                steps_per_epoch=self.num_training_steps,
+                epochs=1,
+                verbose=1,
+                workers=1,
+                use_multiprocessing=False
+            )
 
+    def generate_input(self, batch_size):
+        while True:
+            mini_batch = random.sample(self.memory, min(len(self.memory), batch_size))
+            states, probabilities, wins = zip(*mini_batch)
+            x = np.concatenate([self.prepare_input(state=state) for state in states], axis=0)
+            p = np.array(probabilities)
+            v = np.array(wins)
+            yield x, [p, v]
 
 
 def random_experiment():
@@ -632,13 +677,29 @@ class MCTS:
         return self.root.move
 
 
+def play_against_mcts():
+    game = Game(n=4, width=9, height=7)
+    mcts = MCTS(budget=5000, c=1.4)
+    w = game.play_game(lambda game: mcts.agent(game), agent_human)
+    print({0: 'The computer won.', 1: 'You won!', 2: 'Draw...'}[w])
+
 if __name__ == '__main__':
     # random_experiment()
     # pg = PolicyGradient(width=7, height=6, n=4)
     # pg.train()
     # dq = DeepQ()
     # dq.train()
-    game = Game(n=4, width=9, height=7)
-    mcts = MCTS(budget=5000, c=1.4)
-    w = game.play_game(lambda game: mcts.agent(game), agent_human)
-    print({0: 'The computer won.', 1: 'You won!', 2: 'Draw...'}[w])
+    drl = DRL(
+        width=9,
+        height=7,
+        n=4,
+        num_filters=64,
+        num_residual_blocks=8,
+        batch_size=1024,
+        num_training_steps=1000,
+        num_games=20,
+        mcts_budget=10,
+        mcts_c=1.4,
+        mcts_temperature=0.1
+    )
+    drl.train()
