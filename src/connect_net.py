@@ -5,8 +5,8 @@ import numpy as np
 from scipy.signal import convolve2d
 from tqdm import tqdm
 
-from keras.models import Sequential
-from keras.layers import Convolution2D, BatchNormalization, Flatten, Dense
+from keras.models import Sequential, Input, Model
+from keras.layers import Convolution2D, BatchNormalization, Flatten, Dense, Add
 from keras.optimizers import Adam
 from keras import backend as K
 
@@ -26,7 +26,8 @@ class Game:
         self.history = []
 
     def __str__(self):
-        rows = ['', '%s player\'s turn:' % {-1: 'Black', 1: 'White'}[self.player]]
+        # rows = ['', '%s player\'s turn:' % {-1: 'Black', 1: 'White'}[self.player]]
+        rows = []
         for row in self.state:
             rows.append(' '.join([{-1: '●', 0:'.', 1: '○'}[x] for x in row]))
         return '\n'.join(rows)
@@ -85,7 +86,7 @@ class Game:
                 agent = agent_white
             else:
                 agent = agent_black
-            move = agent(self.state * self.player)  # agent expects white player perspective
+            move = agent(self)
             self.move(move)
             wins = self.win()
             if sum(wins) > 0:
@@ -152,10 +153,9 @@ class Game:
         return memory
 
 
-def agent_random(state):
-    valid_moves = state[0, :] == 0
-    valid_moves_list = np.arange(len(valid_moves))[valid_moves]
-    return np.random.choice(valid_moves_list)
+def agent_random(game):
+    return np.random.choice(game.valid_moves_list())
+
 
 def agent_random_s1(state):
     # if there's a winning move, perform it
@@ -169,6 +169,14 @@ def agent_random_s1(state):
         if wins[0] > 0:
             return move
     return np.random.choice(valid_moves_list)
+
+
+def agent_human(game):
+    columns = [str(c) for c in range(game.width)]
+    print(' '.join(columns))
+    print(game)
+    move = int(input('Your move: '))
+    return move
 
 
 class RootNode:
@@ -192,6 +200,14 @@ class RootNode:
             out_str += ', %d children' % len(self.children)
         return out_str
 
+    def get_child(self, move):
+        child_moves = [child.move for child in self.children]
+        try:
+            i = child_moves.index(move)
+            return self.children[i]
+        except ValueError:
+            return None
+
     def visit(self, infer_state_fn, c):
         if self.leaf:
             wins = self.game.win()
@@ -200,7 +216,7 @@ class RootNode:
                 v = self.game.player * self.game.winner(wins)
             else:
                 valid_moves = self.game.valid_moves_list()
-                p, v = infer_state_fn(self.game.player * self.game.state)
+                p, v = infer_state_fn(self.game)
                 p = p[valid_moves]  # remove invalid moves from prior probabilities
                 self.children = [Node(self, move, P) for move, P in zip(valid_moves, p)]
             self.leaf = False
@@ -233,25 +249,27 @@ class Node(RootNode):
 
     def U(self, c):
         # upper bound function
-        return self.Q() + c * self.P * np.sqrt(np.log(self.parent.N) / (1 + self.N))
+        return c * self.P * np.sqrt(np.log(self.parent.N) / (1 + self.N))
 
 
-def random_state(state):
-    p = np.ones(state.shape[1]) / state.shape[1]
-    num_iter = 100
+def random_playout(game):
+    num_playouts = 1
+    # equal p distribution, is not used here
+    p = np.ones(game.width)
     v = 0
-    for _ in range(1):
-        g = Game(n=4, state=state.copy(), player=1)
+    for _ in range(num_playouts):
+        g = deepcopy(game)
         end_state = g.play_game(agent_random, agent_random)
         if end_state == 0:
-            v += 1
+            v += game.player
         elif end_state == 1:
-            v += - 1
-    v /= num_iter
+            v -= game.player
+    v /= num_playouts
     return p, v
 
 
 class PolicyGradient:
+    """Too simple, doesnt work"""
     def __init__(self, num_games=100, num_iter=10000, width=9, height=6, n=4):
         self.num_games = num_games
         self.num_iter = num_iter
@@ -341,6 +359,7 @@ class PolicyGradient:
 
 
 class DeepQ:
+    """Naive, doesnt work"""
     def __init__(self, num_games=1000000, batch_size=64, width=9, height=6, n=4, gamma=1.0, epsilon=1.0, epsilon_min=0.01, epsilon_log_decay=0.9999):
         self.num_games = num_games
         self.batch_size = batch_size
@@ -448,6 +467,89 @@ class DeepQ:
         print('Random (white) vs model (black): {} white wins, {} black wins, {} draws.'.format(*game_endings))
 
 
+class DRL:
+    def __init__(self, width, height, n, num_filters, num_residual_blocks, num_games, mcts_budget, mcts_c):
+        self.width = width
+        self.height = height
+        self.n = n
+        self.num_games = num_games
+        self.mcts_budget = mcts_budget
+        self.mcts_c = mcts_c
+        self.memory = deque(maxlen=10000)
+        self.model = self.model_definition(self.width, self.height, num_filters, num_residual_blocks)
+
+    @staticmethod
+    def model_definition(width, height, num_filters, num_residual_blocks):
+        # input is 2 layers: stones of both players (1: stone, 0: no), it's always the first player's move
+        def residual_block(input):
+            conv1 = Convolution2D(num_filters, 3, 1, 'same', activation='relu')(input)
+            norm1 = BatchNormalization()(conv1)
+            conv2 = Convolution2D(num_filters, 3, 1, 'same', activation='relu')(norm1)
+            norm2 = BatchNormalization()(conv2)
+            output = Add()([norm2, input])
+            return output
+
+        input = Input(shape=(height, width, 2))
+        conv = Convolution2D(num_filters, 3, 1, 'same', activation='relu')(input)
+        residual_input = BatchNormalization()(conv)
+        for _ in range(num_residual_blocks):
+            residual_output = residual_block(residual_input)
+            residual_input = residual_output
+
+        value_head_conv = Convolution2D(1, 1, 1, 'same', activation='relu')(residual_input)
+        value_head_norm = BatchNormalization()(value_head_conv)
+        value_head_flat = Flatten()(value_head_norm)
+        value_head_hidden = Dense(height * width, activation='relu')(value_head_flat)
+        value_head = Dense(1, activation='tanh', name='value_head')(value_head_hidden)
+
+        policy_head_conv = Convolution2D(2, 1, 1, 'same', activation='relu')(residual_input)
+        policy_head_norm = BatchNormalization()(policy_head_conv)
+        policy_head_flat = Flatten()(policy_head_norm)
+        policy_head = Dense(width)(policy_head_flat, name='policy_head')(policy_head_norm)
+
+        model = Model(input=input, outputs=[policy_head, value_head])
+
+        return model
+
+    def prepare_input(self, game):
+        state = game.state * game.player
+        x = np.concatenate([state == 1, state == -1]).astype(np.int8)
+        return x
+
+    def infer_game(self, game):
+        x = self.prepare_input(game)
+        p, v = self.model.predict(x)
+        return p, v
+
+    def play_game(self):
+        game = Game(width=self.width, height=self.height, n=self.n)
+        root = RootNode(game)
+        while True:
+            for _ in range(self.mcts_budget):
+                root.visit(self.infer_game, c=self.mcts_c)
+            scores = [child.N for child in root.children]
+            i = int(np.argmax(scores))
+            # new root:
+            root = root.children[i]  # remove parent to save memory?
+            # make the move
+            game.move(root.move)
+            wins = game.win()
+            if sum(wins) > 0:
+                break
+        if wins[0] > wins[1]:
+            print('White player wins.')
+        elif wins[0] < wins[1]:
+            print('Black player wins.')
+        elif wins[2] == 1:
+            print('Draw.')
+
+
+    def train(self):
+        for _ in range(self.num_games):
+            self.play_game()
+
+
+
 def random_experiment():
     num_games = 100
     num_columns = 9
@@ -481,12 +583,12 @@ def policy_loss(y_true, y_pred):
 
 
 def mcts():
-    budget = 100
+    budget = 1000
     game = Game(width=7, height=6, n=4)
     root = RootNode(game)
     while True:
         for _ in range(budget):
-            root.visit(random_state, c=1.4)
+            root.visit(random_playout, c=1.4)
         scores = [child.N for child in root.children]
         i = np.argmax(scores)
         # new root:
@@ -506,10 +608,37 @@ def mcts():
             break
 
 
+class MCTS:
+    """Vanilla Monte Carlo Tree Search."""
+    def __init__(self, budget, c):
+        self.c = c
+        self.budget = budget
+        self.root = None
+        self.first_move = True
+
+    def agent(self, game):
+        if self.first_move:
+            g = deepcopy(game)
+            self.root = RootNode(g)
+            self.first_move = False
+        else:
+            opponent_move = game.history[-1][1]
+            self.root = self.root.get_child(move=opponent_move)
+        for _ in range(self.budget):
+            self.root.visit(random_playout, c=self.c)
+        scores = [child.N for child in self.root.children]
+        i = int(np.argmax(scores))
+        self.root = self.root.children[i]
+        return self.root.move
+
+
 if __name__ == '__main__':
     # random_experiment()
     # pg = PolicyGradient(width=7, height=6, n=4)
     # pg.train()
     # dq = DeepQ()
     # dq.train()
-    mcts()
+    game = Game(n=4, width=9, height=7)
+    mcts = MCTS(budget=5000, c=1.4)
+    w = game.play_game(lambda game: mcts.agent(game), agent_human)
+    print({0: 'The computer won.', 1: 'You won!', 2: 'Draw...'}[w])
