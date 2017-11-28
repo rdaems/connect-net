@@ -4,10 +4,13 @@ from collections import deque
 import numpy as np
 from scipy.signal import convolve2d
 from tqdm import tqdm
+from multiprocessing import Process, Queue
 
+import keras
 from keras.models import Sequential, Input, Model
 from keras.layers import Convolution2D, BatchNormalization, Flatten, Dense, Add
 from keras.optimizers import Adam
+from keras.callbacks import ModelCheckpoint
 from keras import backend as K
 
 
@@ -468,18 +471,24 @@ class DeepQ:
 
 
 class DRL:
-    def __init__(self, width, height, n, num_filters, num_residual_blocks, batch_size, num_training_steps, num_games, mcts_budget, mcts_c, mcts_temperature):
+    def __init__(self, width, height, n, num_filters, num_residual_blocks, batch_size, learning_rate, learning_rate_decay, num_epochs, num_games, memory_size, mcts_budget, mcts_c, mcts_temperature, init_model_path=None):
         self.width = width
         self.height = height
         self.n = n
         self.batch_size = batch_size
-        self.num_training_steps = num_training_steps
+        self.learning_rate = learning_rate
+        self.learning_rate_decay = learning_rate_decay
+        self.num_epochs = num_epochs
         self.num_games = num_games
+        self.memory_size = memory_size
         self.mcts_budget = mcts_budget
         self.mcts_c = mcts_c
         self.mcts_temperature = mcts_temperature
-        self.memory = deque(maxlen=10000)
-        self.model = self.model_definition(self.width, self.height, num_filters, num_residual_blocks)
+        self.memory = deque(maxlen=self.memory_size)
+        if init_model_path is None:
+            self.model = self.model_definition(self.width, self.height, num_filters, num_residual_blocks)
+        else:
+            self.model = keras.models.load_model(init_model_path)
 
     @staticmethod
     def model_definition(width, height, num_filters, num_residual_blocks):
@@ -510,7 +519,7 @@ class DRL:
         policy_head_flat = Flatten()(policy_head_norm)
         policy_head = Dense(width, name='policy_head')(policy_head_flat)
 
-        model = Model(input=input, outputs=[policy_head, value_head])
+        model = Model(inputs=[input], outputs=[policy_head, value_head])
 
         return model
 
@@ -526,15 +535,15 @@ class DRL:
         p, v = self.model.predict(x)
         return p.flatten(), v
 
-    def play_game(self):
+    def play_game(self, infer_state_fn, budget, c, temperature):
         game = Game(width=self.width, height=self.height, n=self.n)
         root = RootNode(game)
         memory = []
         while True:
-            for _ in range(self.mcts_budget):
-                root.visit(self.infer_game, c=self.mcts_c)
+            for _ in range(budget):
+                root.visit(infer_state_fn, c=c)
             N = np.array([child.N for child in root.children])
-            pi_valid = N ** (1 / self.mcts_temperature)
+            pi_valid = N ** (1 / temperature)
             pi_valid = pi_valid / pi_valid.sum()
             pi = np.zeros(self.width)
             for i, p in enumerate(pi_valid):
@@ -549,6 +558,7 @@ class DRL:
             game.move(root.move)
             wins = game.win()
             if sum(wins) > 0:
+                memory.append((game.state * game.player, pi))   # don't forget to append the winning game state..
                 break
         if wins[0] > wins[1]:
             print('White player wins.')
@@ -560,30 +570,76 @@ class DRL:
             print('Draw.')
             memory_wins = np.zeros(len(memory))
         memory_w = []
-        for (state, p), w in zip(memory, wins):
+        for (state, p), w in zip(memory, memory_wins):
             memory_w.append((state, p, w))
         memory_augmented = [(state[:, ::-1], p[::-1], w) for state, p, w in memory_w]
         memory = memory_w + memory_augmented
-        self.memory.extend(memory)
+        return memory
+
+    def fill_memory(self):
+        def fill_memory_play(queue):
+            while queue.qsize() < self.memory_size:
+                memory = self.play_game(random_playout, 10, self.mcts_c, self.mcts_temperature)
+                for m in memory:
+                    queue.put(m)
+                print(queue.qsize())
+            print('exitings')
+        num_workers = 8
+        queue = Queue()
+        workers = []
+        for _ in range(num_workers):
+            p = Process(target=fill_memory_play, args=(queue,))
+            workers.append(p)
+            p.start()
+        while len(self.memory) < self.memory_size:
+            m = queue.get()
+            self.memory.append(m)
+        queue.join()
+        for worker in workers:
+            worker.join()
+            print('join')
 
     def train(self):
         self.model.compile(
-            Adam(lr=0.01, decay=0.005),
+            Adam(lr=self.learning_rate, decay=self.learning_rate_decay),
             loss={'policy_head': 'categorical_crossentropy', 'value_head': 'mean_squared_error'}
         )
         self.model.summary()
+        save_checkpoint = ModelCheckpoint('../models/pilot/weights.{epoch:05d}-{loss:.3f}.h5', monitor='loss',
+                                          verbose=0, save_best_only=True, save_weights_only=False, mode='auto',
+                                          period=1)
+
+        # fill memory first with deep MCTS games
+        # self.fill_memory()
+        # print('Memory filled with mcts games.')
         while True:
-            for _ in range(self.num_games):
-                self.play_game()
-                print('%d/%d' % (_, self.num_games))
+            for i in range(self.num_games):
+                memory = self.play_game(self.infer_game, self.mcts_budget, self.mcts_c, self.mcts_temperature)
+                self.memory.extend(memory)
+                print('%d/%d' % (i, self.num_games))
+
             self.model.fit_generator(
                 self.generate_input(self.batch_size),
-                steps_per_epoch=self.num_training_steps,
-                epochs=1,
-                verbose=1,
+                callbacks=[save_checkpoint],
+                steps_per_epoch=1,
+                epochs=self.num_epochs,
+                verbose=2,
                 workers=1,
                 use_multiprocessing=False
             )
+
+            game = Game(n=4, width=9, height=7)
+            mcts_vanilla = MCTS(5000, self.mcts_c)
+            mcts_dl = MCTS(5000, self.mcts_c, self.infer_game)
+            w = game.play_game(lambda game: mcts_vanilla.agent(game), lambda game: mcts_dl.agent(game))
+            print({0: 'MCTS Vanilla won.', 1: 'MCTS DL won!', 2: 'Draw...'}[w])
+            print(game)
+            game = Game(n=4, width=9, height=7)
+            mcts_vanilla = MCTS(5000, self.mcts_c)
+            mcts_dl = MCTS(5000, self.mcts_c, self.infer_game)
+            w = game.play_game(lambda game: mcts_dl.agent(game), lambda game: mcts_vanilla.agent(game))
+            print({0: 'MCTS DL won!', 1: 'MCTS Vanilla won.', 2: 'Draw...'}[w])
+            print(game)
 
     def generate_input(self, batch_size):
         while True:
@@ -592,7 +648,7 @@ class DRL:
             x = np.concatenate([self.prepare_input(state=state) for state in states], axis=0)
             p = np.array(probabilities)
             v = np.array(wins)
-            yield x, [p, v]
+            yield [x], [p, v]
 
 
 def random_experiment():
@@ -655,9 +711,10 @@ def mcts():
 
 class MCTS:
     """Vanilla Monte Carlo Tree Search."""
-    def __init__(self, budget, c):
+    def __init__(self, budget, c, infer_state_fn=random_playout):
         self.c = c
         self.budget = budget
+        self.infer_state_fn = infer_state_fn
         self.root = None
         self.first_move = True
 
@@ -670,7 +727,7 @@ class MCTS:
             opponent_move = game.history[-1][1]
             self.root = self.root.get_child(move=opponent_move)
         for _ in range(self.budget):
-            self.root.visit(random_playout, c=self.c)
+            self.root.visit(self.infer_state_fn, c=self.c)
         scores = [child.N for child in self.root.children]
         i = int(np.argmax(scores))
         self.root = self.root.children[i]
@@ -683,6 +740,7 @@ def play_against_mcts():
     w = game.play_game(lambda game: mcts.agent(game), agent_human)
     print({0: 'The computer won.', 1: 'You won!', 2: 'Draw...'}[w])
 
+
 if __name__ == '__main__':
     # random_experiment()
     # pg = PolicyGradient(width=7, height=6, n=4)
@@ -693,13 +751,17 @@ if __name__ == '__main__':
         width=9,
         height=7,
         n=4,
-        num_filters=64,
+        num_filters=256,
         num_residual_blocks=8,
+        learning_rate=0.010,
+        learning_rate_decay=0.005,
         batch_size=1024,
-        num_training_steps=1000,
-        num_games=20,
-        mcts_budget=10,
+        num_epochs=100,
+        num_games=1000,
+        memory_size=1000000,
+        mcts_budget=60,
         mcts_c=1.4,
-        mcts_temperature=0.1
+        mcts_temperature=1,
+        init_model_path='/home/rembert/connect-net/models/pilot/weights.00100-2.308.h5'
     )
     drl.train()
