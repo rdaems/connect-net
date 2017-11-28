@@ -762,6 +762,6 @@ if __name__ == '__main__':
         mcts_budget=60,
         mcts_c=1.4,
         mcts_temperature=1,
-        init_model_path='/home/rembert/connect-net/models/pilot/weights.00100-2.308.h5'
+        init_model_path='/home/rembert/connect-net/models/pilot/weights.00095-2.070.h5'
     )
     drl.train()
