@@ -5,6 +5,9 @@ import numpy as np
 from scipy.signal import convolve2d
 from tqdm import tqdm
 from multiprocessing import Process, Queue
+import os
+import glob
+import pickle
 
 import keras
 from keras.models import Sequential, Input, Model
@@ -220,7 +223,7 @@ class RootNode:
             else:
                 valid_moves = self.game.valid_moves_list()
                 p, v = infer_state_fn(self.game)
-                p = p[valid_moves]  # remove invalid moves from prior probabilities
+                p = p[valid_moves]  # remove invalid moves from probabilities
                 self.children = [Node(self, move, P) for move, P in zip(valid_moves, p)]
             self.leaf = False
             self.v = v
@@ -252,7 +255,7 @@ class Node(RootNode):
 
     def U(self, c):
         # upper bound function
-        return c * self.P * np.sqrt(np.log(self.parent.N) / (1 + self.N))
+        return c * self.P * np.sqrt(self.parent.N) / (1 + self.N)
 
 
 def random_playout(game):
@@ -471,24 +474,13 @@ class DeepQ:
 
 
 class DRL:
-    def __init__(self, width, height, n, num_filters, num_residual_blocks, batch_size, learning_rate, learning_rate_decay, num_epochs, num_games, memory_size, mcts_budget, mcts_c, mcts_temperature, init_model_path=None):
+    def __init__(self, width, height, n, mcts_budget, mcts_c, model=None):
         self.width = width
         self.height = height
         self.n = n
-        self.batch_size = batch_size
-        self.learning_rate = learning_rate
-        self.learning_rate_decay = learning_rate_decay
-        self.num_epochs = num_epochs
-        self.num_games = num_games
-        self.memory_size = memory_size
         self.mcts_budget = mcts_budget
         self.mcts_c = mcts_c
-        self.mcts_temperature = mcts_temperature
-        self.memory = deque(maxlen=self.memory_size)
-        if init_model_path is None:
-            self.model = self.model_definition(self.width, self.height, num_filters, num_residual_blocks)
-        else:
-            self.model = keras.models.load_model(init_model_path)
+        self.model = model
 
     @staticmethod
     def model_definition(width, height, num_filters, num_residual_blocks):
@@ -530,9 +522,11 @@ class DRL:
         x = np.stack([state == 1, state == -1], axis=-1).astype(np.int8)
         return x[None, ...]
 
-    def infer_game(self, game):
+    def infer_game(self, game, model=None):
+        if model is None:
+            model = self.model
         x = self.prepare_input(game=game)
-        p, v = self.model.predict(x)
+        p, v = model.predict(x)
         return p.flatten(), v
 
     def play_game(self, infer_state_fn, budget, c, temperature):
@@ -561,13 +555,13 @@ class DRL:
                 memory.append((game.state * game.player, pi))   # don't forget to append the winning game state..
                 break
         if wins[0] > wins[1]:
-            print('White player wins.')
-            memory_wins = (np.arange(len(memory)) + 1) % 2
+            # print('White player wins.')
+            memory_wins = (- 1) ** np.arange(len(memory))
         elif wins[0] < wins[1]:
-            print('Black player wins.')
-            memory_wins = np.arange(len(memory)) % 2
+            # print('Black player wins.')
+            memory_wins = (- 1) ** (np.arange(len(memory)) + 1)
         elif wins[2] == 1:
-            print('Draw.')
+            # print('Draw.')
             memory_wins = np.zeros(len(memory))
         memory_w = []
         for (state, p), w in zip(memory, memory_wins):
@@ -576,74 +570,81 @@ class DRL:
         memory = memory_w + memory_augmented
         return memory
 
-    def fill_memory(self):
-        def fill_memory_play(queue):
-            while queue.qsize() < self.memory_size:
-                memory = self.play_game(random_playout, 10, self.mcts_c, self.mcts_temperature)
-                for m in memory:
-                    queue.put(m)
-                print(queue.qsize())
-            print('exitings')
-        num_workers = 8
-        queue = Queue()
-        workers = []
-        for _ in range(num_workers):
-            p = Process(target=fill_memory_play, args=(queue,))
-            workers.append(p)
-            p.start()
-        while len(self.memory) < self.memory_size:
-            m = queue.get()
-            self.memory.append(m)
-        queue.join()
-        for worker in workers:
-            worker.join()
-            print('join')
-
-    def train(self):
-        self.model.compile(
-            Adam(lr=self.learning_rate, decay=self.learning_rate_decay),
-            loss={'policy_head': 'categorical_crossentropy', 'value_head': 'mean_squared_error'}
-        )
-        self.model.summary()
-        save_checkpoint = ModelCheckpoint('../models/pilot/weights.{epoch:05d}-{loss:.3f}.h5', monitor='loss',
-                                          verbose=0, save_best_only=True, save_weights_only=False, mode='auto',
-                                          period=1)
-
-        # fill memory first with deep MCTS games
-        # self.fill_memory()
-        # print('Memory filled with mcts games.')
+    def train(self, model_dir, memory_size, num_games, mcts_temperature, learning_rate, learning_rate_decay, batch_size, num_epochs, model=None):
+        model_save_id = 0   # iterator of saved models
+        if not os.path.exists(model_dir):
+            os.mkdir(model_dir)
+        try:
+            model_paths = sorted(glob.glob(os.path.join(model_dir, 'weights.*.h5')))
+            self.model = keras.models.load_model(model_paths[-1])
+            model_save_id = int(model_paths[-1][-6:-3]) + 1
+            print('Loaded model: %s' % model_paths[-1])
+        except IndexError:
+            if model is None:
+                raise ValueError('No model found in model_dir and no model defined.')
+            else:
+                self.model = model
+                print('No model found in model_dir, initiated with given model.')
+        try:
+            with open(os.path.join(model_dir, 'memory.p'), 'rb') as f:
+                memory = pickle.load(f)
+                print('Memory loaded from model_dir.')
+        except IOError:
+            memory = deque(maxlen=memory_size)
+            print('Memory not found in model_dir.')
+        best_weights = self.model.get_weights()
+        model_config = self.model.get_config()
+        # start training!
         while True:
-            for i in range(self.num_games):
-                memory = self.play_game(self.infer_game, self.mcts_budget, self.mcts_c, self.mcts_temperature)
-                self.memory.extend(memory)
-                print('%d/%d' % (i, self.num_games))
-
+            for i in tqdm(range(num_games)):
+                new_memory = self.play_game(self.infer_game, self.mcts_budget, self.mcts_c, mcts_temperature)
+                memory.extend(new_memory)
+            with open(os.path.join(model_dir, 'memory.p'), 'wb') as f:
+                pickle.dump(memory, f)
+            self.model.compile(
+                Adam(lr=learning_rate, decay=learning_rate_decay),
+                loss={'policy_head': 'categorical_crossentropy', 'value_head': 'mean_squared_error'}
+            )
             self.model.fit_generator(
-                self.generate_input(self.batch_size),
-                callbacks=[save_checkpoint],
+                self.generate_input(memory, batch_size),
                 steps_per_epoch=1,
-                epochs=self.num_epochs,
+                epochs=num_epochs,
                 verbose=2,
                 workers=1,
                 use_multiprocessing=False
             )
+            best_model = Model.from_config(model_config)
+            best_model.set_weights(best_weights)
+            mcts_best = MCTS(self.mcts_budget, self.mcts_c, lambda game: self.infer_game(game, best_model))
+            mcts_new = MCTS(self.mcts_budget, self.mcts_c, self.infer_game)
+            tw1 = [0, 0, 0]
+            for i in range(10):
+                game = Game(n=self.n, width=self.width, height=self.height)
+                mcts_best = MCTS(self.mcts_budget, self.mcts_c, lambda game: self.infer_game(game, best_model))
+                mcts_new = MCTS(self.mcts_budget, self.mcts_c, self.infer_game)
+                w = game.play_game(mcts_best.agent, mcts_new.agent)
+                tw1[w] += 1
+            print('mcts_best (W) vs mcts_new (B): %d %d %d' % (*tw1,))
+            tw2 = [0, 0, 0]
+            for i in range(10):
+                game = Game(n=self.n, width=self.width, height=self.height)
+                mcts_best = MCTS(self.mcts_budget, self.mcts_c, lambda game: self.infer_game(game, best_model))
+                mcts_new = MCTS(self.mcts_budget, self.mcts_c, self.infer_game)
+                w = game.play_game(mcts_new.agent, mcts_best.agent)
+                tw2[w] += 1
+            print('mcts_new (W) vs mcts_best (B): %d %d %d' % (*tw2,))
+            if tw1[1] + tw2[0] > tw1[0] + tw2[1] + 1:
+                print('New best model.')
+                best_weights = self.model.get_weights() # update best weights
+                self.model.save(os.path.join(model_dir, 'weights.%.3d.h5' % model_save_id))
+                model_save_id += 1
+            else:
+                print('New model discarded')
+                self.model.set_weights(best_weights)    # reset to best weights
 
-            game = Game(n=4, width=9, height=7)
-            mcts_vanilla = MCTS(5000, self.mcts_c)
-            mcts_dl = MCTS(5000, self.mcts_c, self.infer_game)
-            w = game.play_game(lambda game: mcts_vanilla.agent(game), lambda game: mcts_dl.agent(game))
-            print({0: 'MCTS Vanilla won.', 1: 'MCTS DL won!', 2: 'Draw...'}[w])
-            print(game)
-            game = Game(n=4, width=9, height=7)
-            mcts_vanilla = MCTS(5000, self.mcts_c)
-            mcts_dl = MCTS(5000, self.mcts_c, self.infer_game)
-            w = game.play_game(lambda game: mcts_dl.agent(game), lambda game: mcts_vanilla.agent(game))
-            print({0: 'MCTS DL won!', 1: 'MCTS Vanilla won.', 2: 'Draw...'}[w])
-            print(game)
-
-    def generate_input(self, batch_size):
+    def generate_input(self, memory, batch_size):
         while True:
-            mini_batch = random.sample(self.memory, min(len(self.memory), batch_size))
+            mini_batch = random.sample(memory, min(len(memory), batch_size))
             states, probabilities, wins = zip(*mini_batch)
             x = np.concatenate([self.prepare_input(state=state) for state in states], axis=0)
             p = np.array(probabilities)
@@ -680,7 +681,7 @@ def test_batch_system():
 
 def policy_loss(y_true, y_pred):
     """Custom loss function. Gradient of chosen action should be 1 if good action, -1 if bad action. Other actions 0."""
-    return - K.sum(K.tf.multiply(y_true, y_pred))
+    return - K.sum(K.tf.multiply(y_true, y_pred))   # just use K.batch_dot ?
 
 
 def mcts():
@@ -747,21 +748,30 @@ if __name__ == '__main__':
     # pg.train()
     # dq = DeepQ()
     # dq.train()
-    drl = DRL(
-        width=9,
-        height=7,
-        n=4,
+    width = 9
+    height = 7
+    n = 4
+    model = DRL.model_definition(
+        width=width,
+        height=height,
         num_filters=256,
         num_residual_blocks=8,
-        learning_rate=0.010,
-        learning_rate_decay=0.005,
+    )
+    drl = DRL(
+        width=width,
+        height=height,
+        n=n,
+        mcts_budget=60,
+        mcts_c=3,
+    )
+    drl.train(
         batch_size=1024,
+        learning_rate=0.001,
+        learning_rate_decay=0.01,
         num_epochs=100,
         num_games=1000,
         memory_size=1000000,
-        mcts_budget=60,
-        mcts_c=1.4,
         mcts_temperature=1,
-        init_model_path='/home/rembert/connect-net/models/pilot/weights.00095-2.070.h5'
+        model_dir='../models/alpha',
+        model=model
     )
-    drl.train()
