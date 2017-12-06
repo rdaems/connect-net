@@ -588,7 +588,7 @@ class DRL:
         try:
             with open(os.path.join(model_dir, 'memory.p'), 'rb') as f:
                 memory = pickle.load(f)
-                print('Memory loaded from model_dir.')
+                print('Memory loaded from model_dir (%d entries).' % len(memory))
         except IOError:
             memory = deque(maxlen=memory_size)
             print('Memory not found in model_dir.')
@@ -615,8 +615,6 @@ class DRL:
             )
             best_model = Model.from_config(model_config)
             best_model.set_weights(best_weights)
-            mcts_best = MCTS(self.mcts_budget, self.mcts_c, lambda game: self.infer_game(game, best_model))
-            mcts_new = MCTS(self.mcts_budget, self.mcts_c, self.infer_game)
             tw1 = [0, 0, 0]
             for i in range(10):
                 game = Game(n=self.n, width=self.width, height=self.height)
@@ -635,7 +633,7 @@ class DRL:
             print('mcts_new (W) vs mcts_best (B): %d %d %d' % (*tw2,))
             if tw1[1] + tw2[0] > tw1[0] + tw2[1] + 1:
                 print('New best model.')
-                best_weights = self.model.get_weights() # update best weights
+                best_weights = self.model.get_weights()     # update best weights
                 self.model.save(os.path.join(model_dir, 'weights.%.3d.h5' % model_save_id))
                 model_save_id += 1
             else:
@@ -742,6 +740,15 @@ def play_against_mcts():
     print({0: 'The computer won.', 1: 'You won!', 2: 'Draw...'}[w])
 
 
+def play_against_mcts_dl(model_path, drl):
+    model = keras.models.load_model(model_path)
+    drl.model = model
+    game = Game(n=4, width=9, height=7)
+    mcts = MCTS(60, 1.4, drl.infer_game)
+    w = game.play_game(mcts.agent, agent_human)
+    print({0: 'The computer won.', 1: 'You won!', 2: 'Draw...'}[w])
+
+
 if __name__ == '__main__':
     # random_experiment()
     # pg = PolicyGradient(width=7, height=6, n=4)
@@ -761,14 +768,15 @@ if __name__ == '__main__':
         width=width,
         height=height,
         n=n,
-        mcts_budget=60,
+        mcts_budget=500,
         mcts_c=3,
     )
+    # play_against_mcts_dl('../models/alpha/weights.008.h5', drl)
     drl.train(
         batch_size=1024,
         learning_rate=0.001,
-        learning_rate_decay=0.01,
-        num_epochs=100,
+        learning_rate_decay=0.0,
+        num_epochs=1000,
         num_games=1000,
         memory_size=1000000,
         mcts_temperature=1,
